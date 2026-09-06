@@ -1,92 +1,147 @@
 # io
 
+基于 `ds::EphemeralBytesArena` 的分片内存字节流。Cargo 包名为 `io`，使用方通过
+`brz-io` 引入，Rust 中使用 `brz_io`。
 
+| 类型 | 标准同步 trait | Tokio 异步 trait（默认启用） |
+| --- | --- | --- |
+| `Writer` | `std::io::Write` | `tokio::io::AsyncWrite` |
+| `Reader` | `std::io::Read`、`std::io::BufRead` | `tokio::io::AsyncRead`、`tokio::io::AsyncBufRead` |
 
-## Getting started
+同一对象的同步和异步操作共享数据和游标。内存操作立即完成，异步实现返回
+`Poll::Ready`，无需后台任务、共享管道或额外 Stream 包装类型。
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 引入
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+在同级 Breeze repo 中进行本地开发：
 
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
+```toml
+[dependencies]
+brz-io = { git = "https://github.com/we-breeze/io.git", package = "io", tag = "v0.0.1" }
+brz-ds = { package = "brz-ds", version = "0.0.2", default-features = false }
 ```
-cd existing_repo
-git remote add origin https://github.com/we-breeze/io.git
-git branch -M master
-git push -uf origin master
+
+纯同步使用方可以对 `brz-io` 设置 `default-features = false`，关闭 Tokio 依赖。
+
+## 写入并读取
+
+```rust
+use brz_ds::EphemeralBytesArena;
+use brz_io::Writer;
+use std::io::{Read, Write};
+
+let arena = EphemeralBytesArena::new(64 * 1024);
+let mut writer = Writer::new(&arena);
+writer.write_all(b"hello ")?;
+writer.write_all(b"world")?;
+
+let mut reader = writer.into_reader();
+let mut text = String::new();
+reader.read_to_string(&mut text)?;
+assert_eq!(text, "hello world");
 ```
 
-## Integrate with your tools
+`Writer::new(&arena)` 无需指定总长度，按需申请分片：首片 2 KiB，随后按
+4、8、16、32、64 KiB 翻倍增长，达到 64 KiB 后保持这个大小。空写入不分配；小块写入会先填满当前片，大块写入会按相同策略跨片。
+分片大小不超过 arena 单个 chunk 的容量。需要总字节上限时使用
+`Writer::with_limit(&arena, max_bytes)`，分片分配同时受剩余预算限制。
+arena 无空间时沿用其堆回退行为。`into_reader()` 转移内存所有权，不复制 payload。
 
-- [ ] [Set up project integrations](https://github.com/we-breeze/io/-/settings/integrations)
+`Read` 将数据直接从各片复制到调用方的目标缓冲；`BufRead::fill_buf` 返回当前片的
+借用视图，不合并所有分片。标准 `read_exact`、`read_line`、`read_until` 和
+`read_to_string` 可以跨片使用，包括 UTF-8 字符跨片的情况。
 
-## Collaborate with your team
+Reader 持有 allocation ticket，可以比外部 arena 句柄存活更久；每个分片完全消费后
+立即释放自己的 ticket。arena 仍需等待同一冻结 chunk 的其他 allocation 都释放后
+才能整块复用。
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+## 从流读取到 EOF 或上限
 
-## Test and Deploy
+```rust
+use brz_ds::EphemeralBytesArena;
+use brz_io::Writer;
+use std::io::{self, Read};
 
-Use the built-in continuous integration in GitLab.
+let arena = EphemeralBytesArena::new(64 * 1024);
+let max_bytes = 5;
+let mut source = io::Cursor::new(b"hello world");
+let mut writer = Writer::with_limit(&arena, max_bytes);
+let copied = io::copy(
+    &mut source.by_ref().take(max_bytes as u64),
+    &mut writer,
+)?;
+assert_eq!(copied, 5);
+assert_eq!(source.position(), 5); // 后续字节没有被消费。
+let reader = writer.into_reader();
+```
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+`take` 保证在上限处成功停止，且不额外读取一个字节探测 EOF。只有 Writer 上限、
+没有 `take` 时，超出的写入遵循标准短写语义：接受剩余额度，满后 `write` 返回
+`Ok(0)`，`write_all` / `copy` 报 `WriteZero`。上游可能已被 `copy` 预读，因此需要
+准确限制输入消费量时应使用 `take`。向已有内容的 Writer 继续 copy 时，使用
+`writer.remaining()` 作为本次输入上限。
 
-***
+达到上限只说明已取得这些字节，不证明输入刚好结束。输入应当是调用方希望消费的
+字节流，例如一条响应的 body；协议消息边界由调用方负责。
 
-# Editing this README
+## 异步 IO
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```rust
+use brz_ds::EphemeralBytesArena;
+use brz_io::Writer;
+use tokio::io::{self, AsyncReadExt};
 
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+let arena = EphemeralBytesArena::new(64 * 1024);
+let max_bytes = 1024;
+let source = &b"hello world"[..]; // 也可以是实现 AsyncRead 的 socket/body。
+let mut writer = Writer::with_limit(&arena, max_bytes);
+io::copy(&mut source.take(max_bytes as u64), &mut writer).await?;
 
-## Name
-Choose a self-explaining name for your project.
+let mut reader = writer.into_reader();
+let mut destination = Vec::new(); // 也可以是实现 AsyncWrite 的 socket/file。
+io::copy(&mut reader, &mut destination).await?;
+assert_eq!(destination, b"hello world");
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+`flush` 和异步 `shutdown` 都是内存写入的空操作，与 Tokio 的 `Vec<u8>` writer
+行为一致，不会封闭 Writer。通过 `into_reader()` 完成写入并转为读取。
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## 借用读取
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+`Reader` 还提供消费数据的 `read_bytes(len)`、`read_str(len)`、`skip(len)`，以及不推进
+游标的 `peek_bytes(offset, len)` 和 `peek_byte(offset)`。`offset` 相对于当前游标，
+`position()` 返回相对于原始输入的消费位置。
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+引用型读取使用 `&self`，可以保留多个结果并继续读取：
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+```rust
+let reader = writer.into_reader();
+let name = reader.read_str(name_len)?;
+let description = reader.read_str(description_len)?;
+// name 和 description 可以同时使用。
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+范围在一个分片内时直接借用；跨片时按请求长度合并到 arena。`read_str` 验证 UTF-8，
+验证失败或输入不足不推进游标。共享读取期间，原始分片和合并后的所有分配都保持
+存活，不覆盖临时空间。重新获得 `&mut Reader` 并执行标准 IO 消费时，可以回收已消费
+分片及额外存储。`store_bytes_with` 允许格式解析器把转义解码等结果直接写入 arena，
+返回的引用同样由 Reader 持有；JSON 规则由独立的 `brz-json` 项目处理。
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+稳定存储采用 `elsa::sync::FrozenVec` 保存 allocation owner；新增的 Box 用于固定
+owner 元数据，payload 仍在 arena 中。本 crate 不包含 unsafe 代码。共享方法的单次
+游标更新是原子的，多步协议解析仍应由一个解析者顺序执行。
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## 验证
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+```sh
+cargo fmt --all -- --check
+cargo test --all-features
+cargo test --no-default-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+`Reader::view()` 为当前未读范围创建借用视图。视图不随源 Reader 的共享游标推进而
+改变，可供 JSON 等解析器维护自己的游标；持有视图期间，Rust 借用规则阻止独占 IO
+提前回收分片。`Reader::as_slice()` 返回全部未读字节，跨片时缓存一次 arena 合并结果，
+后续共享读取保留缓存，恢复独占 IO 时释放缓存。
