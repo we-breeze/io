@@ -1,6 +1,6 @@
-# io
+# brz-io
 
-基于 `ds::EphemeralBytesArena` 的分片内存字节流。Cargo 包名为 `io`，使用方通过
+基于 `ds::EphemeralBytesArena` 的分片内存字节流。Cargo 包名为 `brz-io`，使用方通过
 `brz-io` 引入，Rust 中使用 `brz_io`。
 
 | 类型 | 标准同步 trait | Tokio 异步 trait（默认启用） |
@@ -13,11 +13,11 @@
 
 ## 引入
 
-在同级 Breeze repo 中进行本地开发：
+首次发布成功后，从 crates.io 引入：
 
 ```toml
 [dependencies]
-brz-io = { git = "https://github.com/we-breeze/io.git", package = "io", tag = "v0.0.1" }
+brz-io = "0.0.2"
 brz-ds = { package = "brz-ds", version = "0.0.2", default-features = false }
 ```
 
@@ -145,3 +145,41 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 改变，可供 JSON 等解析器维护自己的游标；持有视图期间，Rust 借用规则阻止独占 IO
 提前回收分片。`Reader::as_slice()` 返回全部未读字节，跨片时缓存一次 arena 合并结果，
 后续共享读取保留缓存，恢复独占 IO 时释放缓存。
+
+## CI and publishing
+
+Pushes and pull requests run rustfmt, Clippy and tests with all features and
+without default features, plus release-mode tests. Cargo.lock is
+tracked. This crate has no Loom models and forbids unsafe code.
+
+The default branch is `main`. Grant this public repository access to the
+`we-breeze` organization Actions secret `CARGO_REGISTRY_TOKEN`. The token must
+allow creating and publishing `brz-io`. Repository rules must allow Actions to
+push version commits and create tags (`contents: write`).
+
+Use **Actions → Publish → Run workflow**, select `main`, and leave `retry_tag`
+empty. Publish increments the latest `v0.0.x` tag, updates Cargo.toml and
+Cargo.lock, runs checks and a publishing dry run, then atomically pushes the
+version commit and annotated tag before uploading to crates.io. The existing
+`v0.0.1` means the next release is `v0.0.2`, replacing the initial unpublished
+Cargo version `0.1.0`. Pushes and merges only run CI; publishing is manual.
+
+If upload fails after the tag is pushed, start a new run with `retry_tag` set
+to that existing tag. This field does not choose a new version. Check crates.io
+before retrying an upload timeout: published versions cannot be overwritten.
+Publishing is serialized and rejects stale checkouts. Source fixes require a
+new release. No GitHub Release is created.
+
+## Operational safety
+
+Use `Writer::with_limit` and bound the input stream when reading untrusted
+payloads. `Writer::new` has no application byte limit. Borrowed cross-segment
+reads and `store_bytes_with` retain additional allocations until exclusive IO
+resumes or the reader is dropped; repeated peeks or failed cross-segment UTF-8
+reads can therefore grow memory usage even without advancing the cursor.
+Treat decoding sizes and repeated parsing attempts as application-level limits.
+
+## License
+
+Licensed under either the MIT license or the Apache License, Version 2.0,
+at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
