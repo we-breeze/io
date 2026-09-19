@@ -12,7 +12,7 @@ name = "brz_io"
 
 [dependencies]
 elsa = "1.11"
-brz-ds = { package = "brz-ds", version = "0.0.2", default-features = false }
+brz-ds = { package = "brz-ds", version = "0.0.3", default-features = false }
 tokio = { version = "1", features = ["io-util"], optional = true }
 
 [features]
@@ -23,4 +23,4 @@ tokio = ["dep:tokio"]
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
