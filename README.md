@@ -144,7 +144,17 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 `Reader::view()` 为当前未读范围创建借用视图。视图不随源 Reader 的共享游标推进而
 改变，可供 JSON 等解析器维护自己的游标；持有视图期间，Rust 借用规则阻止独占 IO
 提前回收分片。`Reader::as_slice()` 返回全部未读字节，跨片时缓存一次 arena 合并结果，
-后续共享读取保留缓存，恢复独占 IO 时释放缓存。
+后续共享读取保留缓存。独占 append 保留既有范围缓存，仅在新增字节后使全量连续缓存
+失效；consume/clear 会释放派生结果。
+
+`ReaderView::slice(start..end)` 建立有界子范围；`chunk_at(offset)` 返回当前段内的借用，
+不会越过视图末尾。`Writer` 和 `Reader` 的 `reserve_exact(additional)` 只保证尾段容量，
+不会增加长度或搬动已有数据；超限返回错误。启用 `tokio` 时，`read_from` 可直接向尾段
+接收最多指定字节，初始化边界由 `brz-ds` 管理。标准 `Read`/`AsyncRead` 仍复制到调用方
+缓冲区。两个段描述符、首个派生结果的持有信息内联保存；唯一的 retained 槽位由
+跨段拼接和 JSON 转义等 `store_bytes_with` 派生结果共享，先到先用。后续结果使用
+稳定的堆所有权；跨段范围仍会缓存，重复读取同一范围不会再次合并。
+这并非无限段或无限派生结果的零分配承诺。
 
 ## CI and publishing
 

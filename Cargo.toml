@@ -12,12 +12,12 @@ name = "brz_io"
 
 [dependencies]
 elsa = "1.11"
-brz-ds = { package = "brz-ds", version = "0.0.4", default-features = false }
+brz-ds = { package = "brz-ds", version = "0.0.5", default-features = false }
 tokio = { version = "1", features = ["io-util"], optional = true }
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio"]
+tokio = ["dep:tokio", "brz-ds/tokio"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }

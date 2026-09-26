@@ -23,6 +23,7 @@
 //! ```
 
 mod reader;
+mod segments;
 mod writer;
 
 #[cfg(feature = "tokio")]
@@ -30,3 +31,5 @@ mod asynchronous;
 
 pub use reader::{Reader, ReaderView};
 pub use writer::Writer;
+
+pub use brz_ds::EphemeralBytesArena;
