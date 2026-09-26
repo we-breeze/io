@@ -1,12 +1,11 @@
-use std::collections::VecDeque;
 use std::io::{self, IoSlice, Write};
 
-use brz_ds::{EphemeralBytesArena, EphemeralBytesMut};
+use crate::segments::Segments;
+use brz_ds::EphemeralBytesArena;
 
 use crate::Reader;
 
 const FIRST_SEGMENT_SIZE: usize = 2 * 1024;
-const MAX_SEGMENT_SIZE: usize = 64 * 1024;
 
 /// A grow-on-demand byte stream backed by arena allocations.
 ///
@@ -19,12 +18,12 @@ const MAX_SEGMENT_SIZE: usize = 64 * 1024;
 /// `flush` is a no-op: every successful write is already stored in memory.
 #[derive(Debug)]
 pub struct Writer {
-    arena: EphemeralBytesArena,
-    segments: VecDeque<EphemeralBytesMut>,
-    max_segment_size: usize,
-    segment_size: usize,
-    limit: usize,
-    len: usize,
+    pub(crate) arena: EphemeralBytesArena,
+    pub(crate) segments: Segments,
+    pub(crate) segment_size: usize,
+    initial_segment_size: usize,
+    pub(crate) limit: usize,
+    pub(crate) len: usize,
 }
 
 impl Writer {
@@ -33,14 +32,43 @@ impl Writer {
     /// Sizes are also capped to the arena chunk capacity. Empty writes do not
     /// allocate or advance this policy.
     pub fn new(arena: &EphemeralBytesArena) -> Self {
+        Self::with_initial_segment_size(arena, FIRST_SEGMENT_SIZE)
+    }
+
+    /// Sets the first implicit segment size (clamped to the arena chunk size).
+    /// Does not allocate payloads or descriptor storage. `size` must be nonzero.
+    pub fn with_initial_segment_size(arena: &EphemeralBytesArena, size: usize) -> Self {
+        assert!(size > 0, "initial segment size must be positive");
+        let size = size.min(arena.chunk_capacity());
         Self {
             arena: arena.clone(),
-            segments: VecDeque::new(),
-            max_segment_size: MAX_SEGMENT_SIZE.min(arena.chunk_capacity()),
-            segment_size: FIRST_SEGMENT_SIZE.min(arena.chunk_capacity()),
+            segments: Segments::new(),
+            segment_size: size,
+            initial_segment_size: size,
             limit: usize::MAX,
             len: 0,
         }
+    }
+
+    /// Guarantees room for `additional` more bytes in the writable tail.
+    /// Does NOT change len, initialize payloads, or relocate the old prefix.
+    /// An insufficient tail is abandoned and one exact-sized segment is added.
+    /// Unlike implicit growth, this is not capped at 64 KiB. Arena heap fallback
+    /// remains possible; callers must check their resource budget before reserving.
+    pub fn reserve_exact(&mut self, additional: usize) -> io::Result<()> {
+        if additional > self.remaining() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reservation exceeds writer limit",
+            ));
+        }
+        self.segments
+            .reserve_exact(&self.arena, self.len, additional)
+    }
+
+    /// Payload segments, including a currently reserved, possibly empty tail.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 
     /// Use the default allocation policy while accepting at most `max_bytes`
@@ -71,11 +99,10 @@ impl Writer {
     pub fn into_reader(self) -> Reader {
         Reader::new(
             self.arena,
-            self.segments
-                .into_iter()
-                .map(EphemeralBytesMut::freeze)
-                .collect(),
+            self.segments,
             self.len,
+            self.initial_segment_size,
+            self.segment_size,
         )
     }
 }
@@ -85,21 +112,12 @@ impl Write for Writer {
         let accepted = bytes.len().min(self.remaining());
         let mut rest = &bytes[..accepted];
         while !rest.is_empty() {
-            if self
-                .segments
-                .back()
-                .is_none_or(|segment| segment.remaining() == 0)
-            {
-                self.segments
-                    .push_back(self.arena.alloc(self.segment_size.min(self.remaining())));
-                self.segment_size = self
-                    .segment_size
-                    .saturating_mul(2)
-                    .min(self.max_segment_size);
-            }
+            let remaining = self.remaining();
+            self.segments
+                .ensure_tail(&self.arena, self.len, remaining, &mut self.segment_size)?;
             let segment = self.segments.back_mut().expect("writable segment");
-            let len = rest.len().min(segment.remaining());
-            segment.extend_from_slice(&rest[..len]);
+            let len = rest.len().min(segment.bytes.remaining());
+            segment.bytes.extend_from_slice(&rest[..len]);
             self.len += len;
             rest = &rest[len..];
         }

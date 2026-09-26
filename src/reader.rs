@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io::{self, BufRead, IoSliceMut, Read};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,9 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use brz_ds::{EphemeralBytes, EphemeralBytesArena, EphemeralBytesMut};
 use elsa::sync::FrozenVec;
 
+use crate::segments::Segments;
+
 #[derive(Debug)]
-struct Segment {
-    start: usize,
+struct Retained {
+    range: Option<(usize, usize)>,
     bytes: EphemeralBytes,
 }
 
@@ -20,37 +21,66 @@ struct Segment {
 /// reads reclaim fully consumed segments; `fill_buf` returns the current piece.
 #[derive(Debug)]
 pub struct Reader {
-    arena: EphemeralBytesArena,
-    segments: VecDeque<Segment>,
+    pub(crate) arena: EphemeralBytesArena,
+    pub(crate) segments: Segments,
     cursor: AtomicUsize,
-    end: usize,
-    retained: FrozenVec<Box<EphemeralBytes>>,
-    contiguous: OnceLock<EphemeralBytes>,
+    pub(crate) end: usize,
+    pub(crate) segment_size: usize,
+    initial_segment_size: usize,
+    // The first cross-segment range or decoded result needs no heap owner.
+    inline_retained: OnceLock<Retained>,
+    retained: FrozenVec<Box<Retained>>,
+    pub(crate) contiguous: OnceLock<EphemeralBytes>,
 }
 
 impl Reader {
     pub(crate) fn new(
         arena: EphemeralBytesArena,
-        segments: VecDeque<EphemeralBytes>,
+        segments: Segments,
         len: usize,
+        initial_segment_size: usize,
+        segment_size: usize,
     ) -> Self {
-        let mut start = 0;
-        let segments = segments
-            .into_iter()
-            .map(|bytes| {
-                let segment = Segment { start, bytes };
-                start += segment.bytes.len();
-                segment
-            })
-            .collect();
         Self {
             arena,
             segments,
             cursor: AtomicUsize::new(0),
             end: len,
+            segment_size,
+            initial_segment_size,
+            inline_retained: OnceLock::new(),
             retained: FrozenVec::new(),
             contiguous: OnceLock::new(),
         }
+    }
+
+    /// Reserve a contiguous append tail without moving initialized input.
+    /// Exclusive access proves that appending cannot invalidate a live view.
+    /// Existing range caches remain valid since their bytes are unchanged.
+    pub fn reserve_exact(&mut self, additional: usize) -> io::Result<()> {
+        self.segments
+            .reserve_exact(&self.arena, self.end, additional)
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Discard all data/caches, reset offsets, and release every arena ticket.
+    /// Intended for an empty keep-alive connection between requests.
+    /// Does not deallocate the uncommon overflow descriptor capacity.
+    pub fn clear(&mut self) {
+        self.segments.clear();
+        self.end = 0;
+        *self.cursor.get_mut() = 0;
+        self.segment_size = self.initial_segment_size;
+        self.clear_retained();
+    }
+
+    fn clear_retained(&mut self) {
+        self.inline_retained.take();
+        self.retained.as_mut().clear();
+        self.contiguous.take();
     }
 
     /// Current byte position, measured from the original start of this reader.
@@ -78,15 +108,15 @@ impl Reader {
         let index = self.locate(position);
         let segment = &self.segments[index];
         if index + 1 == self.segments.len() {
-            return &segment.bytes[position - segment.start..];
+            return &segment.bytes.as_slice()[position - segment.start..];
         }
         // Cache from the first retained segment, independent of the shared
         // cursor. Concurrent callers can therefore safely reuse the same copy.
         let start = self.segments[0].start;
         let bytes = self.contiguous.get_or_init(|| {
             let mut output = self.arena.alloc(self.end - start);
-            for segment in &self.segments {
-                output.extend_from_slice(&segment.bytes);
+            for segment in self.segments.iter() {
+                output.extend_from_slice(segment.bytes.as_slice());
             }
             output.freeze()
         });
@@ -110,7 +140,7 @@ impl Reader {
             return None;
         }
         let segment = &self.segments[self.locate(position)];
-        Some(segment.bytes[position - segment.start])
+        Some(segment.bytes.as_slice()[position - segment.start])
     }
 
     /// Snapshot the unread range without moving the cursor. The view keeps its
@@ -119,6 +149,7 @@ impl Reader {
         ReaderView {
             reader: self,
             start: self.position(),
+            end: self.end,
         }
     }
 
@@ -133,21 +164,37 @@ impl Reader {
         let first = &self.segments[index];
         let offset = position - first.start;
         if len <= first.bytes.len() - offset {
-            return Ok(&first.bytes[offset..offset + len]);
+            return Ok(&first.bytes.as_slice()[offset..offset + len]);
         }
-        self.store_bytes_with(len, |output| {
-            let mut remaining = len;
-            for (i, segment) in self.segments.iter().enumerate().skip(index) {
-                let start = if i == index { offset } else { 0 };
-                let count = remaining.min(segment.bytes.len() - start);
-                output.extend_from_slice(&segment.bytes[start..start + count]);
-                remaining -= count;
-                if remaining == 0 {
-                    break;
+        if let Some(retained) = self
+            .inline_retained
+            .get()
+            .filter(|r| r.range == Some((position, len)))
+        {
+            return Ok(retained.bytes.as_slice());
+        }
+        // Additional ranges must also be merged only once, even when a decoded
+        // result has already occupied the inline slot.
+        if self.inline_retained.get().is_some() {
+            for retained in self.retained.iter() {
+                if retained.range == Some((position, len)) {
+                    return Ok(retained.bytes.as_slice());
                 }
             }
-            Ok(())
-        })
+        }
+        let mut output = self.arena.alloc(len);
+        let mut remaining = len;
+        for (i, segment) in self.segments.iter().enumerate().skip(index) {
+            let start = if i == index { offset } else { 0 };
+            let count = remaining.min(segment.bytes.len() - start);
+            output.extend_from_slice(&segment.bytes.as_slice()[start..start + count]);
+            remaining -= count;
+            if remaining == 0 {
+                break;
+            }
+        }
+        debug_assert_eq!(remaining, 0);
+        Ok(self.retain(output.freeze(), Some((position, len))))
     }
 
     /// Borrow a range relative to the current cursor without consuming it.
@@ -214,7 +261,21 @@ impl Reader {
     ) -> Result<&[u8], E> {
         let mut bytes = self.arena.alloc(capacity);
         encode(&mut bytes)?;
-        Ok(self.retained.push_get(Box::new(bytes.freeze())).as_slice())
+        Ok(self.retain(bytes.freeze(), None))
+    }
+
+    fn retain(&self, bytes: EphemeralBytes, range: Option<(usize, usize)>) -> &[u8] {
+        let retained = Retained { range, bytes };
+        // set returns ownership on a race; no value is lost or invalidated.
+        match self.inline_retained.set(retained) {
+            Ok(()) => self
+                .inline_retained
+                .get()
+                .expect("retained bytes")
+                .bytes
+                .as_slice(),
+            Err(retained) => self.retained.push_get(Box::new(retained)).bytes.as_slice(),
+        }
     }
 
     pub(crate) fn chunk(&self) -> &[u8] {
@@ -223,7 +284,7 @@ impl Reader {
             return &[];
         }
         let segment = &self.segments[self.locate(position)];
-        &segment.bytes[position - segment.start..]
+        &segment.bytes.as_slice()[position - segment.start..]
     }
 
     pub(crate) fn advance(&mut self, count: usize) {
@@ -238,8 +299,7 @@ impl Reader {
             self.segments.pop_front();
         }
         // Exclusive access proves no borrowed result is still in use.
-        self.retained.as_mut().clear();
-        self.contiguous.take();
+        self.clear_retained();
     }
 }
 
@@ -249,32 +309,61 @@ impl Reader {
 pub struct ReaderView<'a> {
     reader: &'a Reader,
     start: usize,
+    end: usize,
 }
 
 impl<'a> ReaderView<'a> {
     pub fn len(&self) -> usize {
-        self.reader.end - self.start
+        self.end - self.start
     }
-
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// A bounded view; bytes belonging to a pipelined next request are excluded.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> io::Result<Self> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(Self {
+            reader: self.reader,
+            start: self.start + range.start,
+            end: self.start + range.end,
+        })
+    }
+
     pub fn peek_byte(&self, offset: usize) -> Option<u8> {
-        self.reader.byte_at(self.start.checked_add(offset)?)
+        if offset >= self.len() {
+            return None;
+        }
+        self.reader.byte_at(self.start + offset)
     }
 
-    /// Borrow bytes relative to the view's start, merging only this range when
-    /// it crosses segments. Returned bytes live as long as the source reader.
     pub fn peek_bytes(&self, offset: usize, len: usize) -> io::Result<&'a [u8]> {
-        let position = self
-            .start
-            .checked_add(offset)
-            .ok_or(io::ErrorKind::UnexpectedEof)?;
-        self.reader.range(position, len)
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        self.reader.range(self.start + offset, len)
     }
 
-    /// Store decoded bytes in the source reader's arena.
+    /// Borrow just the segment containing offset; never coalesces input.
+    /// The returned slice is clamped to this view's end.
+    pub fn chunk_at(&self, offset: usize) -> &'a [u8] {
+        if offset >= self.len() {
+            return &[];
+        }
+        let position = self.start + offset;
+        let segment = &self.reader.segments[self.reader.locate(position)];
+        let bytes = &segment.bytes.as_slice()[position - segment.start..];
+        &bytes[..bytes.len().min(self.end - position)]
+    }
+
+    /// Explicitly request a continuous representation of this view only.
+    /// A cross-segment range uses the bounded inline range cache when available.
+    pub fn as_slice(&self) -> &'a [u8] {
+        self.peek_bytes(0, self.len()).expect("valid reader view")
+    }
+
     pub fn store_bytes_with<E>(
         &self,
         capacity: usize,

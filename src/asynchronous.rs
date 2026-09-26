@@ -66,3 +66,90 @@ impl AsyncWrite for Writer {
         self.poll_flush(cx)
     }
 }
+
+impl Writer {
+    /// Read directly into the writable arena tail. No tokio::io::copy buffer.
+    /// `maximum` limits this read and is additionally clamped to the Writer limit.
+    pub fn poll_read_from<R: AsyncRead + ?Sized>(
+        &mut self,
+        cx: &mut Context<'_>,
+        source: Pin<&mut R>,
+        maximum: usize,
+    ) -> Poll<io::Result<usize>> {
+        let maximum = maximum.min(self.remaining());
+        if maximum == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        if let Err(error) =
+            self.segments
+                .ensure_tail(&self.arena, self.len, maximum, &mut self.segment_size)
+        {
+            return Poll::Ready(Err(error));
+        }
+        let result = self
+            .segments
+            .back_mut()
+            .expect("writable tail")
+            .bytes
+            .poll_read_from(cx, source, maximum);
+        if let Poll::Ready(Ok(count)) = &result {
+            self.len += *count;
+        }
+        result
+    }
+
+    pub async fn read_from<R: AsyncRead + Unpin + ?Sized>(
+        &mut self,
+        source: &mut R,
+        maximum: usize,
+    ) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.poll_read_from(cx, Pin::new(&mut *source), maximum)).await
+    }
+}
+
+impl Reader {
+    /// Append directly into the original receive segments using exclusive access.
+    /// Existing bytes/range caches are unchanged; no packet-prefix copy occurs.
+    /// Bytes already consumed via BufRead are not made visible again.
+    pub fn poll_read_from<R: AsyncRead + ?Sized>(
+        &mut self,
+        cx: &mut Context<'_>,
+        source: Pin<&mut R>,
+        maximum: usize,
+    ) -> Poll<io::Result<usize>> {
+        if maximum == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        if self.end.checked_add(maximum).is_none() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receive length overflow",
+            )));
+        }
+        if let Err(error) =
+            self.segments
+                .ensure_tail(&self.arena, self.end, maximum, &mut self.segment_size)
+        {
+            return Poll::Ready(Err(error));
+        }
+        let result = self
+            .segments
+            .back_mut()
+            .expect("writable tail")
+            .bytes
+            .poll_read_from(cx, source, maximum);
+        if let Poll::Ready(Ok(count @ 1..)) = &result {
+            self.end += *count;
+            self.contiguous.take();
+        }
+        result
+    }
+
+    pub async fn read_from<R: AsyncRead + Unpin + ?Sized>(
+        &mut self,
+        source: &mut R,
+        maximum: usize,
+    ) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.poll_read_from(cx, Pin::new(&mut *source), maximum)).await
+    }
+}
