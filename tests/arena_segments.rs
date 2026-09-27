@@ -150,6 +150,23 @@ mod asynchronous {
         reader.consume(8);
         assert_eq!(reader.view().as_slice(), b"NEXTtail");
     }
+
+    #[tokio::test]
+    async fn clear_resets_the_segment_growth_policy() {
+        let arena = EphemeralBytesArena::new(4096);
+        let mut writer = Writer::with_initial_segment_size(&arena, 4);
+        writer.write_all(b"abcdefghijkl").unwrap();
+        assert_eq!(writer.segment_count(), 2);
+
+        let mut reader = writer.into_reader();
+        reader.clear();
+        let mut source = &b"12345678"[..];
+        assert_eq!(reader.read_from(&mut source, 8).await.unwrap(), 4);
+        assert_eq!(reader.segment_count(), 1);
+        assert_eq!(reader.read_from(&mut source, 4).await.unwrap(), 4);
+        assert_eq!(reader.segment_count(), 2);
+        assert_eq!(reader.as_slice(), b"12345678");
+    }
 }
 
 #[test]
