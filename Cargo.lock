@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "brz-io"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "brz-ds",
  "elsa",
