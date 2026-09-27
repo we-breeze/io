@@ -151,9 +151,9 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 不会越过视图末尾。`Writer` 和 `Reader` 的 `reserve_exact(additional)` 只保证尾段容量，
 不会增加长度或搬动已有数据；超限返回错误。启用 `tokio` 时，`read_from` 可直接向尾段
 接收最多指定字节，初始化边界由 `brz-ds` 管理。标准 `Read`/`AsyncRead` 仍复制到调用方
-缓冲区。两个段描述符、首个派生结果的持有信息内联保存；唯一的 retained 槽位由
-跨段拼接和 JSON 转义等 `store_bytes_with` 派生结果共享，先到先用。后续结果使用
-稳定的堆所有权；跨段范围仍会缓存，重复读取同一范围不会再次合并。
+缓冲区。首段描述符直接内联；第二段与 overflow 队列复用同一块 enum 存储，第三段
+才分配描述符队列。跨段拼接和 JSON 转义等 `store_bytes_with` 派生结果使用稳定的堆
+所有权；跨段范围仍会缓存，重复读取同一范围不会再次合并。
 这并非无限段或无限派生结果的零分配承诺。
 
 ## CI and publishing

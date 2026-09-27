@@ -3,6 +3,8 @@
 use brz_io::{EphemeralBytesArena, Writer};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+#[cfg(feature = "tokio")]
+use std::future::Future;
 use std::io::Write;
 
 thread_local! {
@@ -59,6 +61,25 @@ fn count<T>(work: impl FnOnce() -> T) -> (T, usize) {
     (value, allocations)
 }
 
+#[cfg(feature = "tokio")]
+async fn count_async<T>(work: impl Future<Output = T>) -> (T, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ALLOCATIONS.with(|slot| slot.set(None));
+        }
+    }
+    ALLOCATIONS.with(|slot| {
+        assert!(slot.get().is_none(), "measurement must not be nested");
+        slot.set(Some(0));
+    });
+    let reset = Reset;
+    let value = work.await;
+    let allocations = ALLOCATIONS.with(|slot| slot.get().unwrap());
+    drop(reset);
+    (value, allocations)
+}
+
 #[test]
 fn counter_has_a_positive_control() {
     let (_, allocations) = count(|| std::hint::black_box(vec![1_u8; 4096]));
@@ -66,26 +87,39 @@ fn counter_has_a_positive_control() {
 }
 
 #[test]
-fn two_segments_and_one_cross_segment_range_need_no_descriptor_heap_allocations() {
+fn two_segment_descriptors_are_inline_and_cross_segment_ranges_are_cached() {
     let arena = EphemeralBytesArena::new(1024 * 1024);
-    let (_, allocations) = count(|| {
+    let (reader, allocations) = count(|| {
         let mut writer = Writer::with_initial_segment_size(&arena, 8);
         writer.write_all(b"abcdefgh").unwrap();
         writer.reserve_exact(64).unwrap();
         writer.write_all(&[b'z'; 64]).unwrap();
         let reader = writer.into_reader();
         assert_eq!(reader.segment_count(), 2);
+        reader
+    });
+    assert_eq!(
+        allocations, 0,
+        "two descriptors must not call the global allocator"
+    );
+    let (_, allocations) = count(|| {
         assert_eq!(reader.view().peek_bytes(4, 8).unwrap(), b"efghzzzz");
+    });
+    assert!(
+        allocations > 0,
+        "the first cross-segment range needs a stable heap owner"
+    );
+    let (_, allocations) = count(|| {
         assert_eq!(reader.view().peek_bytes(4, 8).unwrap(), b"efghzzzz");
     });
     assert_eq!(
         allocations, 0,
-        "arena hit and inline metadata should not call the global allocator"
+        "a repeated range must reuse its cached owner"
     );
 }
 
 #[test]
-fn derived_bytes_can_use_the_single_inline_slot_and_ranges_still_cache() {
+fn derived_bytes_use_stable_heap_owners_and_ranges_still_cache() {
     let arena = EphemeralBytesArena::new(1024 * 1024);
     let mut writer = Writer::with_initial_segment_size(&arena, 8);
     writer.write_all(b"abcdefgh").unwrap();
@@ -98,9 +132,9 @@ fn derived_bytes_can_use_the_single_inline_slot_and_ranges_still_cache() {
             .store_bytes_with(4, |bytes| bytes.write_all(b"a\nb\t"))
             .unwrap()
     });
-    assert_eq!(allocations, 0, "derived bytes can use the inline slot");
+    assert!(allocations > 0, "derived bytes need a stable heap owner");
     let (first, allocations) = count(|| reader.peek_bytes(4, 8).unwrap());
-    assert!(allocations > 0, "decoding already occupied the only slot");
+    assert!(allocations > 0, "a new cross-segment range needs an owner");
     let (second, allocations) = count(|| reader.peek_bytes(5, 8).unwrap());
     assert!(allocations > 0, "a second range needs a heap owner");
     for _ in 0..32 {
@@ -120,7 +154,7 @@ fn derived_bytes_can_use_the_single_inline_slot_and_ranges_still_cache() {
 }
 
 #[test]
-fn range_occupies_the_shared_slot_until_clear() {
+fn retained_owners_are_released_by_clear() {
     let arena = EphemeralBytesArena::new(1024 * 1024);
     let mut writer = Writer::with_initial_segment_size(&arena, 4);
     writer.write_all(b"abcd").unwrap();
@@ -128,16 +162,13 @@ fn range_occupies_the_shared_slot_until_clear() {
     writer.write_all(b"efgh").unwrap();
     let mut reader = writer.into_reader();
     let (range, allocations) = count(|| reader.read_str(6).unwrap());
-    assert_eq!(allocations, 0);
+    assert!(allocations > 0);
     let (decoded, allocations) = count(|| {
         reader
             .store_bytes_with(2, |bytes| bytes.write_all(b"a\n"))
             .unwrap()
     });
-    assert!(
-        allocations > 0,
-        "the cross-segment string occupied the slot"
-    );
+    assert!(allocations > 0);
     assert_eq!((range, decoded), ("abcdef", &b"a\n"[..]));
 
     reader.clear();
@@ -146,7 +177,7 @@ fn range_occupies_the_shared_slot_until_clear() {
             .store_bytes_with(2, |bytes| bytes.write_all(b"b\n"))
             .unwrap()
     });
-    assert_eq!(allocations, 0, "clear makes the inline slot reusable");
+    assert!(allocations > 0, "clear releases the earlier heap owners");
     assert_eq!(decoded, b"b\n");
 }
 
@@ -166,6 +197,34 @@ fn explicit_overflow_is_still_supported() {
     assert!(
         allocations > 0,
         "third descriptor is a documented fallback, not zero-allocation"
+    );
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn heap_descriptor_capacity_survives_clear() {
+    let arena = EphemeralBytesArena::new(1024 * 1024);
+    let mut writer = Writer::with_initial_segment_size(&arena, 2);
+    writer.write_all(b"ab").unwrap();
+    writer.reserve_exact(2).unwrap();
+    writer.write_all(b"cd").unwrap();
+    writer.reserve_exact(2).unwrap();
+    writer.write_all(b"ef").unwrap();
+    let mut reader = writer.into_reader();
+    assert_eq!(reader.segment_count(), 3);
+    reader.clear();
+
+    let (_, allocations) = count_async(async {
+        for bytes in [b"gh", b"ij", b"kl"] {
+            let mut input = &bytes[..];
+            assert_eq!(reader.read_from(&mut input, bytes.len()).await.unwrap(), 2);
+        }
+    })
+    .await;
+    assert_eq!(reader.segment_count(), 3);
+    assert_eq!(
+        allocations, 0,
+        "a retained heap deque must reuse its descriptor capacity"
     );
 }
 

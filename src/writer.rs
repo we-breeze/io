@@ -20,8 +20,6 @@ const FIRST_SEGMENT_SIZE: usize = 2 * 1024;
 pub struct Writer {
     pub(crate) arena: EphemeralBytesArena,
     pub(crate) segments: Segments,
-    pub(crate) segment_size: usize,
-    initial_segment_size: usize,
     pub(crate) limit: usize,
     pub(crate) len: usize,
 }
@@ -42,9 +40,7 @@ impl Writer {
         let size = size.min(arena.chunk_capacity());
         Self {
             arena: arena.clone(),
-            segments: Segments::new(),
-            segment_size: size,
-            initial_segment_size: size,
+            segments: Segments::new(size),
             limit: usize::MAX,
             len: 0,
         }
@@ -97,13 +93,7 @@ impl Writer {
     ///
     /// The returned reader owns its storage and can outlive the arena handle.
     pub fn into_reader(self) -> Reader {
-        Reader::new(
-            self.arena,
-            self.segments,
-            self.len,
-            self.initial_segment_size,
-            self.segment_size,
-        )
+        Reader::new(self.arena, self.segments, self.len)
     }
 }
 
@@ -114,7 +104,7 @@ impl Write for Writer {
         while !rest.is_empty() {
             let remaining = self.remaining();
             self.segments
-                .ensure_tail(&self.arena, self.len, remaining, &mut self.segment_size)?;
+                .ensure_tail(&self.arena, self.len, remaining)?;
             let segment = self.segments.back_mut().expect("writable segment");
             let len = rest.len().min(segment.bytes.remaining());
             segment.bytes.extend_from_slice(&rest[..len]);

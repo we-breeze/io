@@ -104,7 +104,7 @@ fn views_keep_their_bounds_when_the_source_cursor_advances() {
 }
 
 #[test]
-fn contiguous_cache_survives_shared_reads_and_resets_after_exclusive_reads() {
+fn retained_range_cache_survives_shared_reads_and_resets_after_exclusive_reads() {
     let mut input = reader(b"abcdefghijkl", 3);
     let all = input.as_slice();
     assert_eq!(all, b"abcdefghijkl");

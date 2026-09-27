@@ -80,10 +80,7 @@ impl Writer {
         if maximum == 0 {
             return Poll::Ready(Ok(0));
         }
-        if let Err(error) =
-            self.segments
-                .ensure_tail(&self.arena, self.len, maximum, &mut self.segment_size)
-        {
+        if let Err(error) = self.segments.ensure_tail(&self.arena, self.len, maximum) {
             return Poll::Ready(Err(error));
         }
         let result = self
@@ -126,10 +123,7 @@ impl Reader {
                 "receive length overflow",
             )));
         }
-        if let Err(error) =
-            self.segments
-                .ensure_tail(&self.arena, self.end, maximum, &mut self.segment_size)
-        {
+        if let Err(error) = self.segments.ensure_tail(&self.arena, self.end, maximum) {
             return Poll::Ready(Err(error));
         }
         let result = self
@@ -140,7 +134,6 @@ impl Reader {
             .poll_read_from(cx, source, maximum);
         if let Poll::Ready(Ok(count @ 1..)) = &result {
             self.end += *count;
-            self.contiguous.take();
         }
         result
     }
