@@ -17,8 +17,8 @@
 
 ```toml
 [dependencies]
-brz-io = "0.0.7"
-brz-ds = { package = "brz-ds", version = "0.0.6", default-features = false }
+brz-io = "0.0.8"
+brz-ds = { package = "brz-ds", version = "0.0.7", default-features = false }
 ```
 
 纯同步使用方可以对 `brz-io` 设置 `default-features = false`，关闭 Tokio 依赖。
